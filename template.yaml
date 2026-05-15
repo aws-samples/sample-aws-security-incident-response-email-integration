@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS Security Incident Response - Email Integration.
+  Enables customers to update SIR cases by sending emails.
+
+Parameters:
+  SesDomain:
+    Type: String
+    Description: Domain verified in SES for receiving email (e.g. yourdomain.com)
+  RecipientAddress:
+    Type: String
+    Description: Email address to receive SIR updates (e.g. sir-cases@yourdomain.com)
+  AllowedSenderDomains:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >
+      Optional comma-separated list of sender domains to allow.
+      Leave empty to allow any sender (authorization checked via case watchers).
+
+Resources:
+
+  # --- KMS Key for SNS encryption ---
+  EmailIngestKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for SIR email integration SNS topic
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowSESEncrypt
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+              - kms:Encrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowSNSUseKey
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+          - Sid: AllowLambdaDecrypt
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+
+  EmailIngestKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/sir-email-ingest
+      TargetKeyId: !Ref EmailIngestKey
+
+  # --- SNS Topic ---
+  EmailIngestTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: sir-email-ingest
+      KmsMasterKeyId: !Ref EmailIngestKey
+
+  EmailIngestTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref EmailIngestTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSESPublish
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref EmailIngestTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+
+  # --- S3 Bucket for access logging ---
+  EmailStorageLoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sir-email-ingest-logs-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  EmailStorageLoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EmailStorageLoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt EmailStorageLoggingBucket.Arn
+              - !Sub ${EmailStorageLoggingBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # --- S3 Bucket for email storage ---
+  EmailStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sir-email-ingest-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref EmailStorageLoggingBucket
+        LogFilePrefix: access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireEmails
+            Status: Enabled
+            ExpirationInDays: 7
+
+  EmailStorageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EmailStorageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSESPut
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${EmailStorageBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt EmailStorageBucket.Arn
+              - !Sub ${EmailStorageBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # --- SES Receipt Rule Set ---
+  SesReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: sir-email-integration-rules
+
+  SesReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn:
+      - EmailIngestTopicPolicy
+      - EmailStorageBucketPolicy
+    Properties:
+      RuleSetName: !Ref SesReceiptRuleSet
+      Rule:
+        Name: sir-email-ingest-rule
+        Enabled: true
+        ScanEnabled: true
+        TlsPolicy: Require
+        Recipients:
+          - !Ref RecipientAddress
+        Actions:
+          - S3Action:
+              BucketName: !Ref EmailStorageBucket
+              ObjectKeyPrefix: incoming/
+              TopicArn: !Ref EmailIngestTopic
+
+  # --- Lambda Function ---
+  EmailHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sir-email-handler
+      Handler: email_handler.handler
+      Runtime: python3.12
+      CodeUri: lambda/
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - security-ir:GetCase
+                - security-ir:CreateCaseComment
+                - security-ir:UpdateCase
+                - security-ir:UpdateCaseStatus
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub ${EmailStorageBucket.Arn}/*
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EmailIngestKey.Arn
+      Events:
+        SNSEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref EmailIngestTopic
+
+  EmailHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${EmailHandlerFunction}
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EmailIngestKey.Arn
+
+  # --- Alarm Notification Topic ---
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: sir-email-integration-alarms
+      KmsMasterKeyId: !Ref EmailIngestKey
+
+  # --- DLQ for failed processing ---
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: sir-email-integration-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref EmailIngestKey
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: sir-email-dlq-messages
+      AlarmDescription: Messages in the email integration DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      OKActions:
+        - !Ref AlarmNotificationTopic
+      InsufficientDataActions:
+        - !Ref AlarmNotificationTopic
+
+Outputs:
+  EmailAddress:
+    Description: Send SIR case updates to this email address
+    Value: !Ref RecipientAddress
+  SNSTopicArn:
+    Description: SNS topic receiving email notifications from SES
+    Value: !Ref EmailIngestTopic
+  LambdaFunctionArn:
+    Description: Lambda function processing emails
+    Value: !GetAtt EmailHandlerFunction.Arn
+  DLQUrl:
+    Description: Dead letter queue for failed email processing
+    Value: !Ref DeadLetterQueue
+  ReceiptRuleSetName:
+    Description: >
+      SES receipt rule set name. You must activate this rule set
+      after deployment (only one active rule set per account).
+    Value: !Ref SesReceiptRuleSet
+  AlarmTopicArn:
+    Description: SNS topic for alarm notifications — subscribe your team here
+    Value: !Ref AlarmNotificationTopic

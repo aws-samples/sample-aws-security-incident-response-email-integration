@@ -26,7 +26,7 @@ Key capabilities:
 
 - Add comments to SIR cases by sending a plain email
 - Update case status, description, or impacted accounts via structured keywords
-- Sender verification against the case's watcher list, which helps prevent updates from unauthorized senders
+- Sender verification against the case's watcher list and IR team membership, which helps prevent updates from unauthorized senders
 - S3-based email storage to handle messages of any size
 - Dead-letter queue with CloudWatch alarm for failed event monitoring
 - TLS enforcement on all inbound email
@@ -297,9 +297,10 @@ appeared.
 - Check CloudWatch Logs: `aws logs tail /aws/lambda/sir-email-handler --region <region>`
 - "No SIR case ID found in subject" — the email subject must contain
   `[SIR-<case-id>]` with a valid numeric case ID
-- "Sender is not a watcher on case" — the `From` address must match a
-  watcher email on the SIR case. Add the sender as a watcher via the
-  SIR console or `UpdateCase` API.
+- "Sender is not a watcher on case" — the `From` address must match either
+  a watcher email on the SIR case or a member of the incident response team
+  configured in the SIR membership. Add the sender as a watcher via the
+  SIR console or `UpdateCase` API, or add them to the IR team.
 - "Case not found or not accessible" — verify the case ID exists and that
   SIR is enabled in the account where the Lambda is deployed
 
@@ -332,15 +333,21 @@ To inspect failed events:
 
 ### Sender Verification
 
-The Lambda function verifies that the sender's email address matches a watcher
-on the SIR case before processing any updates. Emails from senders not on the
-watcher list are logged and discarded. This helps prevent unauthorized parties
-from modifying case data, but does not replace broader email authentication
-controls (DKIM, DMARC) on the sending domain.
+The Lambda function verifies that the sender is authorized to update the case
+by checking two sources:
+
+1. The case's watcher list (per-case authorization)
+2. The incident response team configured in the SIR membership (team-level authorization)
+
+If the sender's email matches either a watcher on the case or a member of the
+IR team, the update is processed. Emails from senders not on either list are
+logged and discarded. This helps prevent unauthorized parties from modifying
+case data, but does not replace broader email authentication controls (DKIM,
+DMARC) on the sending domain.
 
 For stronger sender assurance, customers should configure DMARC on their
 sending domain. Without DMARC enforcement, the `From` header can be spoofed
-to impersonate a legitimate watcher.
+to impersonate a legitimate watcher or team member.
 
 ### Transport Encryption
 
@@ -352,7 +359,8 @@ by SES.
 
 The Lambda execution role is scoped to only the SIR API actions required:
 `security-ir:GetCase`, `security-ir:CreateCaseComment`,
-`security-ir:UpdateCase`, `security-ir:UpdateCaseStatus`, and `s3:GetObject`
+`security-ir:UpdateCase`, `security-ir:UpdateCaseStatus`,
+`security-ir:ListMemberships`, `security-ir:GetMembership`, and `s3:GetObject`
 on the email storage bucket. No wildcard permissions are used beyond the
 SIR resource scope.
 

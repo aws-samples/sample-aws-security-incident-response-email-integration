@@ -246,6 +246,8 @@ Resources:
                 - security-ir:CreateCaseComment
                 - security-ir:UpdateCase
                 - security-ir:UpdateCaseStatus
+                - security-ir:ListMemberships
+                - security-ir:GetMembership
               Resource: '*'
             - Effect: Allow
               Action:

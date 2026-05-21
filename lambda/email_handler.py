@@ -224,7 +224,9 @@ def verify_case_exists(case_id):
 
 def verify_sender(case_id, sender_email):
     """
-    Verify the sender is a watcher on the case.
+    Verify the sender is authorized to update the case.
+    Checks if sender is a watcher on the case OR a member of the
+    incident response team configured in the SIR membership.
     Extracts email from 'Display Name <email@domain.com>' format.
     """
     # Extract bare email from "Name <email>" format
@@ -235,9 +237,40 @@ def verify_sender(case_id, sender_email):
         response = sir_client.get_case(caseId=case_id)
         watchers = response.get("watchers", [])
         watcher_emails = {w.get("email", "").lower() for w in watchers}
-        return bare_email.lower() in watcher_emails
+        if bare_email.lower() in watcher_emails:
+            return True
+
+        # Fallback: check if sender is on the incident response team
+        return is_ir_team_member(bare_email)
     except ClientError as e:
         logger.error("Error checking watchers for case %s: %s", case_id, e)
+        return False
+
+
+def is_ir_team_member(email):
+    """
+    Check if the email belongs to a member of the incident response team
+    by querying the SIR membership.
+    """
+    try:
+        memberships = sir_client.list_memberships()
+        for item in memberships.get("items", []):
+            membership_id = item.get("membershipId")
+            if not membership_id:
+                continue
+            membership = sir_client.get_membership(membershipId=membership_id)
+            ir_team = membership.get("incidentResponseTeam", [])
+            ir_emails = {m.get("email", "").lower() for m in ir_team}
+            if email.lower() in ir_emails:
+                logger.info(
+                    "Sender %s authorized via IR team membership %s",
+                    email,
+                    membership_id,
+                )
+                return True
+        return False
+    except ClientError as e:
+        logger.error("Error checking IR team membership: %s", e)
         return False
 
 
